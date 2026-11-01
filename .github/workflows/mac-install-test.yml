@@ -1,0 +1,53 @@
+name: macOS install test
+
+# Installs the latest Lockpin release on GitHub's macOS machines exactly as a
+# user would (the public one-line installer from lockpin.dev), then checks
+# that the program runs, its service starts, and its cap refuses a call before
+# it reaches the provider. No secrets, no provider keys: the test call is
+# refused by its budget, so nothing is sent anywhere.
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Machine
+        run: sw_vers; uname -m
+
+      - name: Install with the public one-line installer
+        run: curl --proto '=https' --tlsv1.2 -fsSL https://lockpin.dev/install.sh | sh
+
+      - name: The program runs
+        run: |
+          bin="$HOME/.local/bin/lockpin"
+          "$bin" version
+          file "$bin"
+          codesign -dv "$bin" 2>&1 | grep -E "Signature|Identifier|Format" || true
+
+      - name: The service is running
+        run: |
+          bin="$HOME/.local/bin/lockpin"
+          "$bin" service status || true
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8787/lockpin/healthz && exit 0
+            sleep 1
+          done
+          echo "no answer on 127.0.0.1:8787"; tail -50 "$HOME/Library/Logs/Lockpin/lockpin.log" 2>/dev/null; exit 1
+
+      - name: The cap refuses a call before it is sent
+        run: |
+          code=$(curl -s -o body.json -w '%{http_code}' -X POST http://127.0.0.1:8787/anthropic/v1/messages \
+            -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -H 'x-api-key: not-a-real-key' \
+            -H 'X-Lockpin-Task: mac-test' -H 'X-Lockpin-Budget-Usd: 0.0000001' \
+            -d '{"model":"claude-haiku-4-5","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
+          cat body.json; echo
+          test "$code" = 402
