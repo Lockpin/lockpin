@@ -14,6 +14,8 @@ permissions: {}
 
 jobs:
   install:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -23,8 +25,13 @@ jobs:
       - name: Machine
         run: sw_vers; uname -m
 
+      # The lookup is anonymous first. GitHub's runners share addresses, so
+      # its rate limit is often spent already; the token is only the
+      # installer's own retry on a 403 or 429.
       - name: Install with the public one-line installer
         run: curl --proto '=https' --tlsv1.2 -fsSL https://lockpin.dev/install.sh | sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: The program runs
         run: |
