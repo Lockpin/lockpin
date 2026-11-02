@@ -1,0 +1,18 @@
+#!/bin/sh
+# Lockpin pkg postinstall (as root): the /usr/local/bin/lockpin link for
+# people, then a team node when the machine's settings ask for one
+# (packaging/unix/fleet-node). $3 is the target volume; a pkg installed onto
+# another volume does not touch this machine.
+[ "${3:-/}" = "/" ] || exit 0
+pkg="/Library/Application Support/Lockpin/pkg"
+# The link is made here, not carried in the payload, so the pkg never resets
+# /usr/local/bin's owner or mode (Homebrew's on Intel Macs), and only when
+# nothing is there: a Homebrew lockpin or a person's own is left alone.
+if [ ! -e /usr/local/bin/lockpin ] && [ ! -L /usr/local/bin/lockpin ]; then
+  [ -d /usr/local/bin ] || mkdir -p -m 755 /usr/local/bin
+  ln -s "$pkg/lockpin" /usr/local/bin/lockpin ||
+    echo "lockpin: could not link /usr/local/bin/lockpin; the program is $pkg/lockpin"
+elif [ "$(readlink /usr/local/bin/lockpin 2>/dev/null)" != "$pkg/lockpin" ]; then
+  echo "lockpin: /usr/local/bin/lockpin is not this package's; left as it is (the program is $pkg/lockpin)"
+fi
+exec "$pkg/fleet-node" install

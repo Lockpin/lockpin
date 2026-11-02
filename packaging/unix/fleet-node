@@ -1,0 +1,276 @@
+#!/bin/sh
+# Lockpin's package hook for a team node on Linux and macOS: the .deb, the
+# .rpm and the macOS pkg run it as root after installing (install) and before
+# removing (remove). It makes the machine a team node with
+# `lockpin node install` when the machine's settings ask for one, and moves
+# the node to the new program on every upgrade (the node runs its own copy).
+#
+#   fleet-node install   settings say TEAMNODE=1: lockpin node install -yes
+#   fleet-node remove    a node these settings made: lockpin node uninstall -yes
+#
+# Settings: NAME=value lines, # comments, in
+#   Linux  /etc/lockpin/fleet-node.conf
+#   macOS  /Library/Application Support/Lockpin/fleet-node.conf, or else the
+#          managed preference domain dev.lockpin.fleet (a configuration profile)
+#
+#   TEAMNODE=1               make this machine a team node
+#   KEYFILE=/path/keys.txt   provider keys (provider=key per line), first install only
+#   POLICYTRUST=/path/x.pub  pin the signed policy's public key: on the first
+#                            install, then only when it names another file or
+#                            the file changed (fleet-node.applied, next to the
+#                            settings), so an upgrade keeps a key rotated with
+#                            lockpin policy trust, and does not fail when the
+#                            .pub was removed after the first install
+#   POLICYREQUIRED=1         refuse calls while no signed policy is in force
+#   NODEARGS=-flag value     more proxy flags for the node
+#
+# The file is parsed, never run, and must be root's and writable by no one
+# else (nor its folder), since its values become root's command line. So
+# must KEYFILE and POLICYTRUST and every folder above them, since root reads
+# them. This script never reads or deletes the key file; it passes the path on.
+#
+# Exit codes: 0 done (or nothing to do), 3 the settings are refused (nothing
+# was changed), 4 lockpin node install failed (its output is printed).
+#
+# The admin team key a first node install prints is not kept: the output of
+# lockpin node install is held in memory and printed only when it fails;
+# the key is printed only after every step succeeded. docs/install.md,
+# "Fleet install", says so.
+#
+# Root runs the program and this hook only from folders no one else can
+# write to, all the way up: on macOS the pkg installs both in
+# /Library/Application Support/Lockpin/pkg, since Homebrew gives /usr/local to
+# a user on Intel Macs (/usr/local/bin/lockpin is a link for people).
+set -u
+
+action="${1:-}"
+case "$action" in
+  install | remove) ;;
+  *) echo "usage: fleet-node install|remove" >&2; exit 2 ;;
+esac
+
+case "$(uname -s)" in
+  Darwin)
+    conf="/Library/Application Support/Lockpin/fleet-node.conf"
+    exe="/Library/Application Support/Lockpin/pkg/lockpin"
+    folder="/Library/Application Support/Lockpin/node"
+    def=/Library/LaunchDaemons/dev.lockpin.node.plist
+    nodeexe="/Library/Application Support/Lockpin/bin/lockpin"
+    account=_lockpin
+    pref="/Library/Managed Preferences/dev.lockpin.fleet"
+    ;;
+  *)
+    conf=/etc/lockpin/fleet-node.conf
+    exe=/usr/bin/lockpin
+    folder=/var/lib/lockpin
+    def=/etc/systemd/system/lockpin-node.service
+    nodeexe=/usr/local/libexec/lockpin/lockpin
+    account=lockpin
+    pref=""
+    ;;
+esac
+owner=0
+# For the tests only, and never for root: the same paths under a temporary
+# folder, and the uid that stands in for root's.
+if [ "$(id -u)" != 0 ]; then
+  conf="${LOCKPIN_FLEET_CONF:-$conf}"
+  exe="${LOCKPIN_FLEET_EXE:-$exe}"
+  folder="${LOCKPIN_FLEET_FOLDER:-$folder}"
+  def="${LOCKPIN_FLEET_DEF:-$def}"
+  pref="${LOCKPIN_FLEET_PREF-$pref}"
+  owner="${LOCKPIN_FLEET_OWNER:-$owner}"
+fi
+confowner="$owner"
+if [ "$(id -u)" != 0 ]; then
+  confowner="${LOCKPIN_FLEET_CONF_OWNER:-$owner}" # the settings file's alone
+fi
+store="$folder/lockpin-node.sealed"
+state="$(dirname "$conf")/fleet-node.applied" # the key file last pinned, and its SHA-256
+
+say() { echo "lockpin: $*"; }
+# A refusal changes nothing. On remove it is a note: removing the package
+# goes on, and a node is left as it is.
+refuse() {
+  if [ "$action" = remove ]; then
+    echo "lockpin: $*; the team node, if any, is left as it is"
+    exit 0
+  fi
+  echo "lockpin: $*; nothing was changed" >&2
+  exit 3
+}
+
+# Removing with no node installed has nothing to do, whatever the settings say.
+if [ "$action" = remove ] && [ ! -e "$def" ]; then
+  exit 0
+fi
+
+TEAMNODE="" KEYFILE="" POLICYTRUST="" POLICYREQUIRED="" NODEARGS=""
+
+# root_only PATH [UID]: PATH belongs to the owner (root, or UID) and no one
+# else may write to it. A trailing + (an ACL) is refused too, since the mode
+# does not show what it allows.
+root_only() {
+  want="${2:-$owner}"
+  # ls -ln: mode, links, uid, gid, ...; -d for a folder itself.
+  set -- $(ls -lnd "$1" 2>/dev/null) "" "" ""
+  [ "$3" = "$want" ] || return 1
+  case "$1" in
+    ?????w???* | ????????w* | *+) return 1 ;;
+  esac
+  return 0
+}
+
+# root_chain PATH: PATH and every folder above it are root_only, except that
+# a root-owned folder with the sticky bit (/tmp) may be writable by others,
+# who cannot rename what is not theirs in it.
+root_chain() {
+  p="$1"
+  root_only "$p" || return 1
+  while [ "$p" != / ] && [ "$p" != . ]; do
+    p="$(dirname "$p")"
+    set -- $(ls -lnd "$p" 2>/dev/null) "" "" ""
+    [ "$3" = 0 ] || [ "$3" = "$owner" ] || return 1
+    case "$1" in
+      *+) return 1 ;;
+      *t) ;; # sticky
+      ?????w???* | ????????w*) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+hook="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+root_chain "$hook" || refuse "$hook, or a folder above it, can be changed by someone other than root"
+root_chain "$exe" || refuse "$exe, or a folder above it, can be changed by someone other than root"
+
+read_file() {
+  root_only "$conf" "$confowner" || refuse "$conf must belong to root and be writable by no one else"
+  root_only "$(dirname "$conf")" || refuse "$(dirname "$conf") must belong to root and be writable by no one else"
+  n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    # Trim spaces and tabs at both ends.
+    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    case "$line" in "" | "#"*) continue ;; esac
+    case "$line" in *=*) ;; *) refuse "$conf line $n: not NAME=value" ;; esac
+    name="$(printf '%s' "${line%%=*}" | sed 's/[[:space:]]*$//')"
+    value="$(printf '%s' "${line#*=}" | sed 's/^[[:space:]]*//')"
+    # One pair of double quotes around a value is dropped.
+    case "$value" in \"*\") value="${value#\"}"; value="${value%\"}" ;; esac
+    case "$name" in
+      TEAMNODE) TEAMNODE="$value" ;;
+      KEYFILE) KEYFILE="$value" ;;
+      POLICYTRUST) POLICYTRUST="$value" ;;
+      POLICYREQUIRED) POLICYREQUIRED="$value" ;;
+      NODEARGS) NODEARGS="$value" ;;
+      *) refuse "$conf line $n: unknown setting $name" ;;
+    esac
+  done < "$conf"
+}
+
+# A configuration profile lands in /Library/Managed Preferences, root's.
+read_pref() {
+  for name in TEAMNODE KEYFILE POLICYTRUST POLICYREQUIRED NODEARGS; do
+    value="$(/usr/bin/defaults read "$pref" "$name" 2>/dev/null)" || continue
+    eval "$name=\$value" # name is one of the five above, never from the file
+  done
+}
+
+if [ -e "$conf" ]; then
+  read_file
+elif [ -n "$pref" ] && [ -e "$pref.plist" ]; then
+  read_pref
+fi
+
+flag() { # NAME VALUE: 1, 0 or empty
+  case "$2" in
+    1 | true) echo 1 ;;
+    "" | 0 | false) echo 0 ;;
+    *) refuse "$1=$2: use 1 or 0" ;;
+  esac
+}
+teamnode="$(flag TEAMNODE "$TEAMNODE")" || exit 3
+required="$(flag POLICYREQUIRED "$POLICYREQUIRED")" || exit 3
+if [ "$action" = remove ]; then
+  # flag's refusal ran in a subshell; on remove it printed a note and went on.
+  case "$teamnode" in *lockpin:*) printf '%s\n' "$teamnode"; exit 0 ;; esac
+  case "$required" in *lockpin:*) required=0 ;; esac
+fi
+
+if [ "$action" = remove ]; then
+  if [ "$teamnode" != 1 ]; then
+    say "a team node is still installed ($def), with its own copy of lockpin; remove it with: sudo \"$nodeexe\" node uninstall"
+    exit 0
+  fi
+  if out="$("$exe" node uninstall -yes 2>&1 </dev/null)"; then
+    rm -f "$state"
+    say "stopped and removed the team node; kept $folder (sealed store, keys file, ledger) and the account $account"
+  else
+    # Removing the package goes on: the node keeps running from its own copy.
+    say "lockpin node uninstall failed, so the team node is still installed:"
+    printf '%s\n' "$out"
+  fi
+  exit 0
+fi
+
+if [ "$teamnode" != 1 ]; then
+  if [ -e "$def" ]; then
+    say "a team node is installed here ($def) and runs its own copy of lockpin; to move it to this version, run lockpin node install again, elevated, with its flags"
+  fi
+  exit 0
+fi
+
+set -- node install -yes
+first=1
+if [ -e "$store" ]; then
+  first=0
+  [ -z "$KEYFILE" ] || say "the node's sealed store is there and keeps its provider keys: KEYFILE is not used (to replace them: lockpin node install -reseal -key-file FILE)"
+else
+  [ -n "$KEYFILE" ] || refuse "TEAMNODE=1 needs KEYFILE, the provider key file, for the first install"
+  case "$KEYFILE" in /*) ;; *) refuse "KEYFILE=$KEYFILE: give a full path" ;; esac
+  [ -f "$KEYFILE" ] || refuse "KEYFILE=$KEYFILE: no such file"
+  root_chain "$KEYFILE" || refuse "KEYFILE=$KEYFILE, or a folder above it, can be changed by someone other than root"
+  set -- "$@" -key-file "$KEYFILE"
+fi
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum < "$1"; else shasum -a 256 < "$1"; fi | cut -d' ' -f1
+}
+pinned="" # what to record once the key is pinned
+if [ -n "$POLICYTRUST" ]; then
+  case "$POLICYTRUST" in /*) ;; *) refuse "POLICYTRUST=$POLICYTRUST: give a full path" ;; esac
+  if [ ! -f "$POLICYTRUST" ]; then
+    [ "$first" = 0 ] || refuse "POLICYTRUST=$POLICYTRUST: no such file"
+    say "POLICYTRUST=$POLICYTRUST is not there: the key the node has pinned is kept"
+  else
+    root_chain "$POLICYTRUST" || refuse "POLICYTRUST=$POLICYTRUST, or a folder above it, can be changed by someone other than root"
+    pinned="$(printf 'POLICYTRUST=%s\nSHA256=%s' "$POLICYTRUST" "$(sha256 "$POLICYTRUST")")"
+    before=""
+    if [ -f "$state" ] && root_only "$state"; then before="$(cat "$state")"; fi
+    if [ "$first" = 1 ] || [ "$before" != "$pinned" ]; then
+      set -- "$@" -policy-trust "$POLICYTRUST"
+    else
+      pinned=""
+      say "POLICYTRUST is the key pinned before: not pinned again (a key rotated with lockpin policy trust stays)"
+    fi
+  fi
+fi
+[ "$required" = 1 ] && set -- "$@" -policy-required
+[ -n "$NODEARGS" ] && set -- "$@" -args "$NODEARGS"
+
+out="$("$exe" "$@" 2>&1 </dev/null)"
+code=$?
+if [ "$code" = 0 ]; then
+  if [ -n "$pinned" ]; then
+    (umask 022 && printf '%s\n' "$pinned" > "$state.tmp" && mv -f "$state.tmp" "$state") ||
+      say "could not record the pinned key in $state; the next upgrade pins it again"
+  fi
+  if [ "$first" = 1 ]; then
+    say "made this machine a team node (lockpin node status shows it); the admin team key was not kept (docs/install.md, Fleet install)"
+  else
+    say "moved the team node to this version; its sealed store and keys file are kept"
+  fi
+  exit 0
+fi
+say "lockpin node install failed (exit $code):"
+printf '%s\n' "$out"
+exit 4

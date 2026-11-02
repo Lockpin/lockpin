@@ -51,3 +51,68 @@ jobs:
             -d '{"model":"claude-haiku-4-5","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}')
           cat body.json; echo
           test "$code" = 402
+
+  # Builds the macOS installer packages from the release's own archives with
+  # the same script the release uses (packaging/macos/build-pkg.sh, copied
+  # here), installs the one for this Mac, checks what it put where, then
+  # removes it with its uninstall script. The pkg is not signed, which
+  # `installer` run by root does not ask for.
+  pkg:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PKGDIR: /Library/Application Support/Lockpin/pkg
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the release's macOS archives
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          [ -n "$tag" ] || tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          case "$(uname -m)" in arm64) echo "ARCH=arm64" >> "$GITHUB_ENV" ;; x86_64) echo "ARCH=amd64" >> "$GITHUB_ENV" ;; esac
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" -D dist -p 'lockpin_*_darwin_*.tar.gz' -p SHA256SUMS
+          ls -l dist
+          # The licence files the pkg carries are the ones in the release.
+          name="lockpin_${tag#v}_darwin_arm64"
+          tar -xzf "dist/$name.tar.gz" "$name/LICENSE" "$name/NOTICE"
+          cp "$name/LICENSE" "$name/NOTICE" .
+
+      - name: Build both packages
+        run: VERSION="$TAG" sh packaging/macos/build-pkg.sh
+
+      - name: What the package holds
+        run: |
+          pkg="dist/packages/lockpin_${TAG#v}_darwin_$ARCH.pkg"
+          pkgutil --payload-files "$pkg"
+          pkgutil --expand "$pkg" expanded
+          find expanded -maxdepth 3
+          test -x expanded/lockpin-component.pkg/Scripts/postinstall
+
+      - name: Install it as root, as Jamf or a double-click would
+        run: sudo installer -pkg "dist/packages/lockpin_${TAG#v}_darwin_$ARCH.pkg" -target / -verboseR
+
+      - name: Installed where the docs say
+        run: |
+          set -x
+          ls -l "$PKGDIR"
+          test "$(readlink /usr/local/bin/lockpin)" = "$PKGDIR/lockpin"
+          /usr/local/bin/lockpin version | grep -F "${TAG#v}"
+          file "$PKGDIR/lockpin" | grep -q "$(uname -m)"
+          pkgutil --pkg-info dev.lockpin.pkg | grep -F "version: ${TAG#v}"
+          # Only root may change the folder root runs from.
+          stat -f '%Su %Sp' "$PKGDIR" | grep -E '^root d....-..-.'
+          test ! -e /Library/LaunchDaemons/dev.lockpin.node.plist
+
+      - name: Remove it with its uninstall script
+        run: |
+          sudo "$PKGDIR/uninstall.sh"
+          test ! -e "$PKGDIR"
+          test ! -e /usr/local/bin/lockpin
+          if pkgutil --pkg-info dev.lockpin.pkg; then echo "receipt still there"; exit 1; fi
