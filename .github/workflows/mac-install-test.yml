@@ -7,6 +7,11 @@ name: macOS install test
 # refused by its budget, so nothing is sent anywhere.
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Build and test the pkg for this release tag, including a draft (empty: the latest release)"
+        required: false
+        default: ""
   release:
     types: [published]
 
@@ -14,6 +19,9 @@ permissions: {}
 
 jobs:
   install:
+    # The one-line installer reads the latest published release, so a run for
+    # a draft tag tests only the pkg.
+    if: github.event_name == 'release' || inputs.tag == ''
     permissions:
       contents: read
     strategy:
@@ -71,7 +79,9 @@ jobs:
         os: [macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: read
+      # write only so the run's token can read a draft release's assets; the
+      # job uploads nothing to the release.
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       PKGDIR: /Library/Application Support/Lockpin/pkg
@@ -80,7 +90,7 @@ jobs:
 
       - name: Download the release's macOS archives
         run: |
-          tag="${{ github.event.release.tag_name }}"
+          tag="${{ github.event.release.tag_name }}${{ inputs.tag }}"
           [ -n "$tag" ] || tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
           echo "TAG=$tag" >> "$GITHUB_ENV"
           case "$(uname -m)" in arm64) echo "ARCH=arm64" >> "$GITHUB_ENV" ;; x86_64) echo "ARCH=amd64" >> "$GITHUB_ENV" ;; esac
@@ -93,6 +103,13 @@ jobs:
 
       - name: Build both packages
         run: VERSION="$TAG" sh packaging/macos/build-pkg.sh
+
+      - name: Keep the packages from this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.os }}
+          path: dist/packages/*.pkg
+          if-no-files-found: error
 
       - name: What the package holds
         run: |
